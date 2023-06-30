@@ -33,13 +33,13 @@ def main(args):
 
     if args.split_fn:
         idx_sample = list(pd.read_csv(args.split_fn, header=None)[1])
-    else:
+    elif 0 < args.split and args.split < 1.0:
         idx_sample = np.random.choice(np.arange(features.shape[0]), size=int(features.shape[0]*args.split))
 
-    print("Sample:", len(idx_sample))
+        print("Sample:", len(idx_sample))
 
-    test_df = test_df.loc[idx_sample].reset_index(drop=True)
-    features = features[idx_sample]
+        test_df = test_df.loc[idx_sample].reset_index(drop=True)
+        features = features[idx_sample]
 
     if args.query is not None:
         test_df = test_df.query(args.query)

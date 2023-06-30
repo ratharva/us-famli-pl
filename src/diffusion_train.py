@@ -50,7 +50,8 @@ def main(args):
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.out,
         filename='{epoch}-{val_loss:.2f}',
-        save_top_k=2,
+        save_top_k=args.save_top_k,
+        save_last=True,
         monitor='val_loss'
     )
 
@@ -58,7 +59,7 @@ def main(args):
 
     if args.tb_dir:
         logger = TensorBoardLogger(save_dir=args.tb_dir, name=args.tb_name)  
-        image_logger = DiffusionImageLogger()  
+        image_logger = DiffusionImageLogger(num_images=args.num_images)  
 
     elif args.neptune_tags:
         logger = NeptuneLogger(
@@ -66,7 +67,7 @@ def main(args):
             tags=args.neptune_tags,
             api_key=os.environ['NEPTUNE_API_TOKEN']
         )
-        image_logger = DiffusionImageLoggerNeptune()
+        image_logger = DiffusionImageLoggerNeptune(num_images=args.num_images)
 
     trainer = Trainer(
         logger=logger,
@@ -98,6 +99,8 @@ if __name__ == '__main__':
     hparams_group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=0.01)
     hparams_group.add_argument('--kl_weight', help='Weight decay for optimizer', type=float, default=1e-6)    
     hparams_group.add_argument('--autoencoder_warm_up_n_epochs', help='Warmup epochs', type=float, default=10)        
+    hparams_group.add_argument('--num_train_timesteps', help='Num train steps for ddpml', type=int, default=1000)
+    hparams_group.add_argument('--latent_channels', help='Latent Channels', type=int, default=3)    
 
     input_group = parser.add_argument_group('Input')
     input_group.add_argument('--nn', help='Type of neural network', type=str, default="AutoEncoderKL")
@@ -110,9 +113,12 @@ if __name__ == '__main__':
 
     output_group = parser.add_argument_group('Output')
     output_group.add_argument('--out', help='Output directory', type=str, default="./")
+    output_group.add_argument('--save_top_k', help='Save k top models', type=int, default=2)
+    
     
     log_group = parser.add_argument_group('Logging')
     log_group.add_argument('--neptune_tags', help='Neptune tags', type=str, nargs="+", default=None)
+    log_group.add_argument('--num_images', help='Max number of images', type=int, default=16)
     log_group.add_argument('--tb_dir', help='Tensorboard output dir', type=str, default=None)
     log_group.add_argument('--tb_name', help='Tensorboard experiment name', type=str, default="diffusion")
 

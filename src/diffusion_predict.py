@@ -29,11 +29,12 @@ def main(args):
     if(os.path.splitext(args.csv)[1] == ".csv"):        
         df_test = pd.read_csv(os.path.join(args.mount_point, args.csv))
     else:        
-        df_test = pd.read_parquet(os.path.join(args.mount_point, args.csv))
+        df_test = pd.read_parquet(os.path.join(args.mount_point, args.csv)).reset_index(drop=True)
 
 
     NN = getattr(diffusion, args.nn)
-    model = NN(**vars(args)).load_from_checkpoint(args.model)
+    model = NN.load_from_checkpoint(args.model)
+    model.eval()
     model.cuda()
 
 
@@ -59,12 +60,34 @@ def main(args):
             if not os.path.exists(out_dir):
                 os.makedirs(out_dir)
 
-            if not os.path.exists(out_fname):
+
+            out_fname_z_mu = out_fname.replace(".nrrd", "z_mu.nrrd")
+            out_fname_z_sigma = out_fname.replace(".nrrd", "z_sigma.nrrd")
+
+            if not os.path.exists(out_fname_z_mu) or not os.path.exists(out_fname_z_sigma) or args.ow:
                 try:
-                    X_hat, z_mu, z_sigma = model(X)
+                    X_ = model(X)
+                    if len(X_) == 3:
+                        X_hat, z_mu, z_sigma = X_
+
+                        z_mu = z_mu[0].permute(1,2,0).cpu().numpy()
+                        z_sigma = z_sigma[0].permute(1,2,0).cpu().numpy()
+
+                        out_fname_z_mu = out_fname.replace(".nrrd", "z_mu.nrrd")
+                        z_mu = sitk.GetImageFromArray(z_mu, isVector=True)
+                        sitk.WriteImage(z_mu, out_fname_z_mu)
+
+                        out_fname_z_sigma = out_fname.replace(".nrrd", "z_sigma.nrrd")
+                        z_sigma = sitk.GetImageFromArray(z_sigma, isVector=True)
+                        sitk.WriteImage(z_sigma, out_fname_z_sigma)
+                        
+
+                    elif len(X_) == 2:
+                        X_hat, _l = X_
+
                     X_hat = X_hat[0].cpu().numpy()                    
-                    header = nrrd.read_header(fname)
-                    nrrd.write(out_fname, X_hat, header, index_order='C')
+                    # header = nrrd.read_header(fname)
+                    # nrrd.write(out_fname, X_hat, header, index_order='C')
                 except:
                     print("ERROR:", fname, file=sys.stderr)
 
@@ -88,6 +111,7 @@ if __name__ == '__main__':
 
     output_group = parser.add_argument_group('Output')
     output_group.add_argument('--out', help='Output directory', type=str, default="./")
+    output_group.add_argument('--ow', help='Overwrite', type=int, default=0)
 
     args = parser.parse_args()
 

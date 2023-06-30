@@ -9,14 +9,13 @@ import pytorch_lightning as pl
 
 import torchmetrics
 
-from generative.inferers import LatentDiffusionInferer
+
 from generative.losses.adversarial_loss import PatchAdversarialLoss
 from generative.losses.perceptual import PerceptualLoss
-# from generative.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from generative.networks import nets
-from generative.networks.schedulers import DDPMScheduler
-from torch.cuda.amp import GradScaler
-from torch.cuda.amp import autocast
+from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
+from generative.inferers import LatentDiffusionInferer
+from generative.inferers import DiffusionInferer
 
 from monai import transforms
 
@@ -56,12 +55,16 @@ class AutoEncoderKL(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
+        latent_channels = 3
+        if hasattr(self.hparams, "latent_channels"):
+            latent_channels = self.hparams.latent_channels
+
         self.autoencoderkl = nets.AutoencoderKL(
             spatial_dims=2,
             in_channels=1,
             out_channels=1,
             num_channels=(128, 128, 256),
-            latent_channels=3,
+            latent_channels=latent_channels,
             num_res_blocks=2,
             attention_levels=(False, False, False),
             with_encoder_nonlocal_attn=False,
@@ -196,6 +199,327 @@ class AutoEncoderKL(pl.LightningModule):
         return self.autoencoderkl(images)
 
 
+class AutoEncoderTanh(nets.AutoencoderKL):
+    def sampling(self, z_mu, z_sigma):
+        x = super().sampling(z_mu, z_sigma)
+        return F.tanh(x)
+
+class AutoEncoderTanhPL(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        latent_channels = 1
+
+        if hasattr(self.hparams, "latent_channels"):
+            latent_channels = self.hparams.latent_channels
+
+        self.autoencoder = AutoEncoderTanh(
+            spatial_dims=2,
+            in_channels=1,
+            out_channels=1,
+            num_channels=(128, 128, 256),
+            latent_channels=latent_channels,
+            num_res_blocks=2,
+            attention_levels=(False, False, False),
+            with_encoder_nonlocal_attn=False,
+            with_decoder_nonlocal_attn=False,
+        )
+
+        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
+
+        self.automatic_optimization = False
+
+        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
+
+        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")        
+
+        self.noise_transform = torch.nn.Sequential(
+            GaussianNoise(0.0, 0.05),
+            RandCoarseShuffle(),
+            SaltAndPepper()
+        )
+        
+
+    def configure_optimizers(self):
+        optimizer_g = optim.AdamW(self.autoencoder.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        optimizer_d = optim.AdamW(self.discriminator.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        return [optimizer_g, optimizer_d]
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch
+
+        optimizer_g, optimizer_d = self.optimizers()
+        
+        optimizer_g.zero_grad()
+
+        reconstruction, z_mu, z_sigma = self.autoencoder(self.noise_transform(x))
+
+        recons_loss = F.l1_loss(reconstruction.float(), x.float())
+        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
+        kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3])
+        kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
+        loss_g = recons_loss + (self.hparams.kl_weight * kl_loss) + (self.hparams.perceptual_weight * p_loss)
+
+        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
+            logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
+            generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
+            loss_g += self.hparams.adversarial_weight * generator_loss
+
+        loss_g.backward()
+        optimizer_g.step()
+        
+        loss_d = 0
+        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
+            
+            optimizer_d.zero_grad()
+
+            logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
+            loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
+            logits_real = self.discriminator(x.contiguous().detach())[-1]
+            loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
+            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
+
+            loss_d = self.hparams.adversarial_weight * discriminator_loss
+
+            loss_d.backward()
+            optimizer_d.step()
+
+        self.log("train_loss_g", loss_g)
+        self.log("train_loss_d", loss_d)
+
+        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
+        
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch
+
+        reconstruction, z_mu, z_sigma = self.autoencoder(x)
+        recon_loss = F.l1_loss(x.float(), reconstruction.float())
+
+        self.log("val_loss", recon_loss, sync_dist=True)
+
+
+    def forward(self, images):        
+        return self.autoencoder(images)
+
+
+class DecoderKL(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        latent_channels = 3
+        if hasattr(self.hparams, "latent_channels"):
+            latent_channels = self.hparams.latent_channels
+
+        self.decoder = nets.AutoencoderKL(
+            spatial_dims=2,
+            in_channels=1,
+            out_channels=1,
+            num_channels=(128, 128, 256),
+            latent_channels=latent_channels,
+            num_res_blocks=2,
+            attention_levels=(False, False, False),
+            with_encoder_nonlocal_attn=False,
+            with_decoder_nonlocal_attn=False,
+        ).decoder
+
+        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
+
+        self.automatic_optimization = False
+
+        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
+
+        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")
+
+        self.noise_transform = torch.nn.Sequential(
+            GaussianNoise(0.0, 0.05),
+            RandCoarseShuffle(),
+            SaltAndPepper()
+        )
+
+        self.resize_transform = transforms.Resize([-1, 64, 64])
+        
+
+    def configure_optimizers(self):
+        optimizer_g = optim.AdamW(self.decoder.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        optimizer_d = optim.AdamW(self.discriminator.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        return [optimizer_g, optimizer_d]
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch
+
+        optimizer_g, optimizer_d = self.optimizers()
+        
+        optimizer_g.zero_grad()
+
+        reconstruction = self(self.noise_transform(x))
+
+        recons_loss = F.l1_loss(reconstruction.float(), x.float())
+        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
+        # kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3])
+        # kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
+        # loss_g = recons_loss + (self.hparams.kl_weight * kl_loss) + (self.hparams.perceptual_weight * p_loss)
+        loss_g = recons_loss + (self.hparams.perceptual_weight * p_loss)
+
+        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
+            logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
+            generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
+            loss_g += self.hparams.adversarial_weight * generator_loss
+
+        loss_g.backward()
+        optimizer_g.step()
+        
+        loss_d = 0
+        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
+            
+            optimizer_d.zero_grad()
+
+            logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
+            loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
+            logits_real = self.discriminator(x.contiguous().detach())[-1]
+            loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
+            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
+
+            loss_d = self.hparams.adversarial_weight * discriminator_loss
+
+            loss_d.backward()
+            optimizer_d.step()
+
+        self.log("train_loss_g", loss_g)
+        self.log("train_loss_d", loss_d)
+
+        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
+        
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch
+
+        reconstruction = self(x)
+        recon_loss = F.l1_loss(x.float(), reconstruction.float())
+
+        self.log("val_loss", recon_loss, sync_dist=True)
+
+
+    def forward(self, images):        
+        return self.decoder(self.resize_transform(images))
+
+class AutoEncoderLowKL(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.model = nets.AutoencoderKL(
+            spatial_dims=2,
+            in_channels=1,
+            out_channels=1,
+            num_channels=(128, 128, 256),
+            latent_channels=self.hparams.latent_channels,
+            num_res_blocks=2,
+            attention_levels=(False, False, False),
+            with_encoder_nonlocal_attn=False,
+            with_decoder_nonlocal_attn=False,
+        )
+
+        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
+
+        self.automatic_optimization = False
+
+        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
+
+        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")
+
+        self.noise_transform = torch.nn.Sequential(
+            GaussianNoise(0.0, 0.05),
+            RandCoarseShuffle(),
+            SaltAndPepper()
+        )
+
+        self.resize_transform_low = transforms.Resize([-1, 64, 64])
+        self.resize_transform_high = transforms.Resize([-1, 256, 256])
+        
+
+    def configure_optimizers(self):
+        optimizer_g = optim.AdamW(self.model.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        optimizer_d = optim.AdamW(self.discriminator.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        return [optimizer_g, optimizer_d]
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch
+
+        optimizer_g, optimizer_d = self.optimizers()
+        
+        optimizer_g.zero_grad()
+
+        reconstruction, z_mu, z_sigma = self(self.noise_transform(self.resize_transform_low(x)))
+
+        recons_loss = F.l1_loss(reconstruction.float(), x.float())
+        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
+        kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3])
+        kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
+        loss_g = recons_loss + (self.hparams.kl_weight * kl_loss) + (self.hparams.perceptual_weight * p_loss)
+        loss_g = recons_loss + (self.hparams.perceptual_weight * p_loss)
+
+        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
+            logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
+            generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
+            loss_g += self.hparams.adversarial_weight * generator_loss
+
+        loss_g.backward()
+        optimizer_g.step()
+        
+        loss_d = 0
+        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
+            
+            optimizer_d.zero_grad()
+
+            logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
+            loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
+            logits_real = self.discriminator(x.contiguous().detach())[-1]
+            loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
+            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
+
+            loss_d = self.hparams.adversarial_weight * discriminator_loss
+
+            loss_d.backward()
+            optimizer_d.step()
+
+        self.log("train_loss_g", loss_g)
+        self.log("train_loss_d", loss_d)
+
+        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
+        
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch
+
+        reconstruction, z_mu, z_sigma = self(self.resize_transform_low(x))
+        recon_loss = F.l1_loss(x.float(), reconstruction.float())
+
+        self.log("val_loss", recon_loss, sync_dist=True)
+
+
+    def forward(self, images):        
+        return self.model(self.resize_transform_high(images))
 
 class CycleAutoEncoderKL(pl.LightningModule):
     def __init__(self, autoencoderkl_mr, autoencoderkl_us, **kwargs):
@@ -419,9 +743,6 @@ class CycleAutoEncoderKL(pl.LightningModule):
 
         self.log("val_loss", recon_loss, sync_dist=True)
 
-        
-
-
     def forward(self, images):        
         return self.get_us(images)
 
@@ -619,3 +940,609 @@ class CycleAutoEncoderKLV2(pl.LightningModule):
 
     def forward(self, images):        
         return self.get_us(images)
+
+
+class VQVAEPL(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.vqvae = nets.VQVAE(
+            spatial_dims=2,
+            in_channels=1,
+            out_channels=1,
+            num_channels=(64, 128, 256, 512, 1024),
+            num_res_channels=512,
+            num_res_layers=2,
+            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1)),
+            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
+            num_embeddings=256,
+            embedding_dim=128
+        )
+
+        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
+
+        self.automatic_optimization = False
+
+        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
+
+        self.adv_loss = PatchAdversarialLoss(criterion="least_squares")        
+        self.l1_loss = torch.nn.L1Loss()
+
+        self.adv_weight = 0.01
+        self.perceptual_weight = 0.001
+
+        self.noise_transform = torch.nn.Sequential(
+            GaussianNoise(0.0, 0.05),
+            RandCoarseShuffle(),
+            SaltAndPepper()
+            
+        )
+        
+
+    def configure_optimizers(self):
+        optimizer_g = optim.AdamW(self.vqvae.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        optimizer_d = optim.AdamW(self.discriminator.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        return [optimizer_g, optimizer_d]
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch
+
+        optimizer_g, optimizer_d = self.optimizers()
+        
+        optimizer_g.zero_grad(set_to_none=True)
+
+        reconstruction, quantization_loss = self.vqvae(images=self.noise_transform(x))
+        logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
+
+        recons_loss = self.l1_loss(reconstruction.float(), x.float())
+        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
+        generator_loss = self.adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
+        loss_g = recons_loss + quantization_loss + self.perceptual_weight * p_loss + self.adv_weight * generator_loss
+
+        loss_g.backward()
+        optimizer_g.step()
+
+
+        # Discriminator part
+        optimizer_d.zero_grad(set_to_none=True)
+
+        logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
+        loss_d_fake = self.adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
+        logits_real = self.discriminator(x.contiguous().detach())[-1]
+        loss_d_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)
+        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
+
+        loss_d = self.adv_weight * discriminator_loss
+
+        loss_d.backward()
+        optimizer_d.step()
+
+        self.log("train_loss_g", loss_g)
+        self.log("train_loss_d", loss_d)
+
+        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
+        
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch
+
+        reconstruction, quantization_loss = self.vqvae(images=x)
+        recon_loss = self.l1_loss(x.float(), reconstruction.float())
+
+        self.log("val_loss", recon_loss, sync_dist=True)
+
+
+    def forward(self, images):        
+        return self.vqvae(images)
+
+
+
+class VQVAEPLFull(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.vqvae = nets.VQVAE(
+            spatial_dims=2,
+            in_channels=1,
+            out_channels=1,
+            num_channels=(64, 128, 256, 512, 1024, 2048),
+            num_res_channels=512,
+            num_res_layers=2,
+            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1)),
+            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
+            num_embeddings=256,
+            embedding_dim=128
+        )
+
+        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
+
+        self.automatic_optimization = False
+
+        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
+
+        self.adv_loss = PatchAdversarialLoss(criterion="least_squares")        
+        self.l1_loss = torch.nn.L1Loss()
+
+        self.adv_weight = 0.01
+        self.perceptual_weight = 0.001
+
+        self.noise_transform = torch.nn.Sequential(
+            GaussianNoise(0.0, 0.05),
+            RandCoarseShuffle(),
+            SaltAndPepper()
+            
+        )
+        
+
+    def configure_optimizers(self):
+        optimizer_g = optim.AdamW(self.vqvae.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        optimizer_d = optim.AdamW(self.discriminator.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        return [optimizer_g, optimizer_d]
+
+    def training_step(self, train_batch, batch_idx):
+        x = train_batch
+
+        optimizer_g, optimizer_d = self.optimizers()
+        
+        optimizer_g.zero_grad(set_to_none=True)
+
+        reconstruction, quantization_loss = self.vqvae(images=self.noise_transform(x))
+        logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
+
+        recons_loss = self.l1_loss(reconstruction.float(), x.float())
+        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
+        generator_loss = self.adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
+        loss_g = recons_loss + quantization_loss + self.perceptual_weight * p_loss + self.adv_weight * generator_loss
+
+        loss_g.backward()
+        optimizer_g.step()
+
+
+        # Discriminator part
+        optimizer_d.zero_grad(set_to_none=True)
+
+        logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
+        loss_d_fake = self.adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
+        logits_real = self.discriminator(x.contiguous().detach())[-1]
+        loss_d_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)
+        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
+
+        loss_d = self.adv_weight * discriminator_loss
+
+        loss_d.backward()
+        optimizer_d.step()
+
+        self.log("train_loss_g", loss_g)
+        self.log("train_loss_d", loss_d)
+
+        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
+        
+
+    def validation_step(self, val_batch, batch_idx):
+        x = val_batch
+
+        reconstruction, quantization_loss = self.vqvae(images=x)
+        recon_loss = self.l1_loss(x.float(), reconstruction.float())
+
+        self.log("val_loss", recon_loss, sync_dist=True)
+
+
+    def forward(self, images):        
+        return self.vqvae(images)
+
+
+
+class GanKL(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        vqvae = nets.VQVAE(
+            spatial_dims=2,
+            in_channels=1,
+            out_channels=3,
+            num_channels=(8, 16, 32, 64, 256, 512),
+            num_res_channels=256,
+            num_res_layers=1,
+            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1)),
+            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
+            num_embeddings=256,
+            embedding_dim=self.hparams.emb_dim
+        )
+
+        self.decoder = vqvae.decoder
+        self.quantizer = vqvae.quantizer
+
+        # self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
+
+        self.automatic_optimization = False
+
+        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=3, out_channels=3)        
+
+        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")
+        
+
+    def configure_optimizers(self):
+        optimizer_g = optim.AdamW(self.decoder.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+
+        optimizer_d = optim.AdamW(self.discriminator.parameters(),
+                                lr=self.hparams.lr_d,
+                                weight_decay=self.hparams.weight_decay)
+
+        return [optimizer_g, optimizer_d]
+
+    def sampling(self, z_mu: torch.Tensor, z_sigma: torch.Tensor) -> torch.Tensor:
+        """
+        From the mean and sigma representations resulting of encoding an image through the latent space,
+        obtains a noise sample resulting from sampling gaussian noise, multiplying by the variance (sigma) and
+        adding the mean.
+
+        Args:
+            z_mu: Bx[Z_CHANNELS]x[LATENT SPACE SIZE] mean vector obtained by the encoder when you encode an image
+            z_sigma: Bx[Z_CHANNELS]x[LATENT SPACE SIZE] variance vector obtained by the encoder when you encode an image
+
+        Returns:
+            sample of shape Bx[Z_CHANNELS]x[LATENT SPACE SIZE]
+        """
+        eps = torch.randn_like(z_sigma)
+        z_vae = z_mu + eps * z_sigma
+        return z_vae
+    
+
+    def training_step(self, train_batch, batch_idx):
+        z_mu = train_batch["z_mu"]
+        z_sigma = train_batch["z_sigma"]
+
+        z_vae = self.sampling(z_mu, z_sigma)
+
+
+        optimizer_g, optimizer_d = self.optimizers()
+        
+        optimizer_g.zero_grad()
+
+
+        fake, x_loss = self(z_vae.shape[0])
+        
+        logits_fake = self.discriminator(fake.contiguous().float())[-1]
+        generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
+        loss_g = generator_loss + x_loss
+
+        loss_g.backward()
+        optimizer_g.step()       
+
+        loss_d = 0.
+        
+        optimizer_d.zero_grad()
+
+        logits_fake = self.discriminator(fake.contiguous().detach())[-1]
+        loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
+        logits_real = self.discriminator(z_vae.contiguous().detach())[-1]
+        loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
+        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
+
+        loss_d = discriminator_loss
+
+        loss_d.backward()
+        optimizer_d.step()
+
+        self.log("train_loss_g", loss_g)
+        self.log("train_loss_d", loss_d)
+
+        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
+
+    def validation_step(self, val_batch, batch_idx):
+
+        z_mu = val_batch["z_mu"]
+        z_sigma = val_batch["z_sigma"]
+
+        z_vae = self.sampling(z_mu, z_sigma)
+
+        fake, x_loss = self(z_vae.shape[0])
+        
+        logits_fake = self.discriminator(fake.contiguous().float())[-1]
+        generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
+        loss_g = generator_loss
+
+        logits_fake = self.discriminator(fake.contiguous().detach())[-1]
+        loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
+        logits_real = self.discriminator(z_vae.contiguous().detach())[-1]
+        loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
+        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
+
+        loss_d = discriminator_loss        
+
+        self.log("val_loss_g", loss_g, sync_dist=True)
+        self.log("val_loss_d", loss_d, sync_dist=True)
+        self.log("val_loss", loss_d + loss_g, sync_dist=True)
+
+
+    def forward(self, num):
+        x = torch.randn(num, self.hparams.emb_dim, 1, 1).to(self.device)
+        x_loss, x = self.quantizer(x)
+        return self.decoder(x), x_loss
+
+        
+
+class DDPMPL(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        in_channels = 3
+        if hasattr(self.hparams, "in_channels"):
+            in_channels = self.hparams.in_channels
+
+        out_channels = 3
+        if hasattr(self.hparams, "out_channels"):
+            out_channels = self.hparams.out_channels
+        
+        self.model = nets.DiffusionModelUNet(
+            spatial_dims=2,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_channels=(128, 256, 256),
+            attention_levels=(False, True, True),
+            num_res_blocks=1,
+            num_head_channels=256,
+        )
+
+        if hasattr(self.hparams, "use_pre_trained") and self.hparams.use_pre_trained:
+            model = torch.hub.load("marksgraham/pretrained_generative_models:v0.2", model="ddpm_2d", verbose=True)
+
+
+        self.scheduler = DDPMScheduler(num_train_timesteps=self.hparams.num_train_timesteps)
+        self.inferer = DiffusionInferer(self.scheduler)
+        
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+        
+        return optimizer
+    
+
+    def training_step(self, train_batch, batch_idx):
+
+        images = train_batch
+
+        noise = torch.randn_like(images)
+
+        # Create timesteps
+        timesteps = torch.randint(
+            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
+        ).long()
+
+        # Get model prediction
+        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
+
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+        self.log("train_loss", loss)
+
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+
+        images = val_batch
+
+        noise = torch.randn_like(images)
+
+        # Create timesteps
+        timesteps = torch.randint(
+            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
+        ).long()
+
+        # Get model prediction
+        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
+
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+
+        self.log("val_loss", loss, sync_dist=True)
+
+
+    def forward(self, x):
+
+        noise = torch.randn_like(x).to(self.device)
+
+        self.scheduler.set_timesteps(num_inference_steps=self.hparams.num_train_timesteps)        
+
+        return self.inferer.sample(input_noise=noise, diffusion_model=self.model, scheduler=self.scheduler, verbose=False)
+
+class DDPMPL64(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        in_channels = 3
+        if hasattr(self.hparams, "in_channels"):
+            in_channels = self.hparams.in_channels
+
+        out_channels = 3
+        if hasattr(self.hparams, "out_channels"):
+            out_channels = self.hparams.out_channels
+        
+        self.model = nets.DiffusionModelUNet(
+            spatial_dims=2,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_channels=(128, 256, 256),
+            attention_levels=(False, True, True),
+            num_res_blocks=1,
+            num_head_channels=256,
+        )
+
+        if hasattr(self.hparams, "use_pre_trained") and self.hparams.use_pre_trained:
+            model = torch.hub.load("marksgraham/pretrained_generative_models:v0.2", model="ddpm_2d", verbose=True)
+
+
+        self.resize_transform = transforms.Resize([-1, 64, 64])
+        self.scheduler = DDPMScheduler(num_train_timesteps=self.hparams.num_train_timesteps)
+        self.inferer = DiffusionInferer(self.scheduler)
+        
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+        
+        return optimizer
+    
+
+    def training_step(self, train_batch, batch_idx):
+
+        images = train_batch
+        images = self.resize_transform(images)
+
+        noise = torch.randn_like(images)
+
+        # Create timesteps
+        timesteps = torch.randint(
+            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
+        ).long()
+
+        # Get model prediction
+        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
+
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+        self.log("train_loss", loss)
+
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+
+        images = val_batch
+        images = self.resize_transform(images)
+
+        noise = torch.randn_like(images)
+
+        # Create timesteps
+        timesteps = torch.randint(
+            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
+        ).long()
+
+        # Get model prediction
+        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
+
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+
+        self.log("val_loss", loss, sync_dist=True)
+
+
+    def forward(self, x):
+
+        noise = torch.randn_like(self.resize_transform(x)).to(self.device)
+
+        self.scheduler.set_timesteps(num_inference_steps=self.hparams.num_train_timesteps)        
+
+        return self.inferer.sample(input_noise=noise, diffusion_model=self.model, scheduler=self.scheduler, verbose=False)
+
+
+class DDPMPL64_ddim(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        in_channels = 3
+        if hasattr(self.hparams, "in_channels"):
+            in_channels = self.hparams.in_channels
+
+        out_channels = 3
+        if hasattr(self.hparams, "out_channels"):
+            out_channels = self.hparams.out_channels
+        
+        self.model = nets.DiffusionModelUNet(
+            spatial_dims=2,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_channels=(128, 256, 256),
+            attention_levels=(False, True, True),
+            num_res_blocks=1,
+            num_head_channels=256,
+        )
+
+        if hasattr(self.hparams, "use_pre_trained") and self.hparams.use_pre_trained:
+            model = torch.hub.load("marksgraham/pretrained_generative_models:v0.2", model="ddpm_2d", verbose=True)
+
+
+        self.resize_transform = transforms.Resize([-1, 64, 64])
+        self.scheduler = DDIMScheduler(num_train_timesteps=self.hparams.num_train_timesteps)
+        self.inferer = DiffusionInferer(self.scheduler)
+        
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+        
+        return optimizer
+    
+
+    def training_step(self, train_batch, batch_idx):
+
+        images = train_batch
+        images = self.resize_transform(images)
+
+        noise = torch.randn_like(images)
+
+        # Create timesteps
+        timesteps = torch.randint(
+            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
+        ).long()
+
+        # Get model prediction
+        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
+
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+        self.log("train_loss", loss)
+
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+
+        images = val_batch
+        images = self.resize_transform(images)
+
+        noise = torch.randn_like(images)
+
+        # Create timesteps
+        timesteps = torch.randint(
+            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
+        ).long()
+
+        # Get model prediction
+        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
+
+        loss = F.mse_loss(noise_pred.float(), noise.float())
+
+
+        self.log("val_loss", loss, sync_dist=True)
+
+
+    def forward(self, x):
+
+        noise = torch.randn_like(self.resize_transform(x)).to(self.device)
+
+        self.scheduler.set_timesteps(num_inference_steps=self.hparams.num_train_timesteps)        
+
+        return self.inferer.sample(input_noise=noise, diffusion_model=self.model, scheduler=self.scheduler, verbose=False)

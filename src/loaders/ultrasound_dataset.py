@@ -297,12 +297,16 @@ class USDataModule(pl.LightningDataModule):
         # Assign train/val datasets for use in dataloaders
         self.train_ds = USDataset(self.df_train, self.mount_point, img_column=self.img_column, class_column=self.class_column, ga_column=self.ga_column, scalar_column=self.scalar_column, transform=self.train_transform, repeat_channel=self.repeat_channel)
         self.val_ds = USDataset(self.df_val, self.mount_point, img_column=self.img_column, class_column=self.class_column, ga_column=self.ga_column, scalar_column=self.scalar_column, transform=self.valid_transform, repeat_channel=self.repeat_channel)
+        self.test_ds = USDataset(self.df_test, self.mount_point, img_column=self.img_column, class_column=self.class_column, ga_column=self.ga_column, scalar_column=self.scalar_column, transform=self.test_transform, repeat_channel=self.repeat_channel)
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last, shuffle=True, prefetch_factor=1)
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last, shuffle=True, prefetch_factor=2)
 
     def val_dataloader(self):
         return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last)
     
 
 class USDataModuleBlindSweep(pl.LightningDataModule):
@@ -398,3 +402,74 @@ class USDataModuleVolumes(pl.LightningDataModule):
         return volumes, ga
 
 
+
+
+
+class USZDataset(Dataset):
+    def __init__(self, df, mount_point = "./", transform=None, img_column="img_path"):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.img_column = img_column        
+
+    def __len__(self):
+        return len(self.df.index)
+
+    def __getitem__(self, idx):
+        
+        img_path = os.path.join(self.mount_point, self.df.iloc[idx][self.img_column])
+
+        img_path_z_mu = img_path.replace(".nrrd", "z_mu.nrrd")
+        img_path_z_sigma = img_path.replace(".nrrd", "z_mu.nrrd")
+
+        z_mu, head = nrrd.read(img_path_z_mu, index_order="C")
+        z_sigma, head = nrrd.read(img_path_z_mu, index_order="C")
+
+        
+        z_mu = torch.tensor(z_mu, dtype=torch.float32)
+        z_sigma = torch.tensor(z_sigma, dtype=torch.float32)
+
+        if len(z_mu.shape) == 2:
+            z_mu = z_mu.unsqueeze(0)
+        if len(z_sigma.shape) == 2:
+            z_sigma = z_sigma.unsqueeze(0)
+            
+        
+        img = {"z_mu": z_mu, "z_sigma": z_sigma}
+        
+        if(self.transform):
+            img = self.transform(img)
+        
+        return img
+
+class USZDataModule(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, img_column="img_path", train_transform=None, valid_transform=None, test_transform=None, drop_last=False):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.img_column = img_column        
+        self.train_transform = train_transform
+        self.valid_transform = valid_transform
+        self.test_transform = test_transform
+        self.drop_last=drop_last        
+
+    def setup(self, stage=None):
+
+        # Assign train/val datasets for use in dataloaders
+        self.train_ds = USZDataset(self.df_train, self.mount_point, img_column=self.img_column, transform=self.train_transform)
+        self.val_ds = USZDataset(self.df_val, self.mount_point, img_column=self.img_column, transform=self.valid_transform)
+        self.test_ds = USZDataset(self.df_test, self.mount_point, img_column=self.img_column, transform=self.test_transform)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last, shuffle=True, prefetch_factor=2)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last)

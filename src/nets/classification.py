@@ -37,16 +37,16 @@ class GaussianNoise(nn.Module):
         return x + torch.normal(mean=self.mean, std=self.std, size=x.size(), device=x.device)
 
 class EfficientNet(pl.LightningModule):
-    def __init__(self, args = None, base_encoder='efficientnet_b0', num_classes=4, lr=1e-3, weight_decay=1e-4, class_weights=None):
+    def __init__(self, **kwargs):
         super().__init__()
         self.save_hyperparameters()
 
-        template_model = getattr(torchvision.models, self.hparams.base_encoder)
-        self.convnet = template_model(num_classes=num_classes)
+        NN = getattr(torchvision.models, self.hparams.base_encoder)
+        self.convnet = NN(num_classes=self.hparams.num_classes)
 
         self.extract_features = False
 
-        if hasattr(args, 'model_feat') and args.model_feat:
+        if hasattr(self.hparams, 'model_feat') and self.hparams.model_feat is not None:
             classifier = self.convnet.classifier
             self.convnet.classifier = nn.Identity()
             self.convnet.load_state_dict(torch.load(args.model_feat))
@@ -55,15 +55,17 @@ class EfficientNet(pl.LightningModule):
             self.convnet.classifier = classifier
 
 
-        if(class_weights is not None):
-            class_weights = torch.tensor(class_weights).to(torch.float32)
+        class_weights = None
+        if(hasattr(self.hparams, 'class_weights')):
+            class_weights = torch.tensor(self.hparams.class_weights).to(torch.float32)
+
         self.loss = nn.CrossEntropyLoss(weight=class_weights)
-        self.accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+        self.accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=self.hparams.num_classes)
 
         self.softmax = nn.Softmax(dim=1)
 
         self.noise_transform = torch.nn.Sequential(
-            GaussianNoise()
+            GaussianNoise(std=0.05)
         )
 
     def configure_optimizers(self):
@@ -75,7 +77,7 @@ class EfficientNet(pl.LightningModule):
     def training_step(self, train_batch, batch_idx):
         x, y = train_batch
         
-        x = self(x)
+        x = self(self.noise_transform(x))
 
         loss = self.loss(x, y)
         
@@ -96,6 +98,17 @@ class EfficientNet(pl.LightningModule):
         self.accuracy(x, y)
         self.log("val_acc", self.accuracy)
 
+    def test_step(self, test_batch, batch_idx):
+        x, y = test_batch
+        
+        x = self(x)
+        
+        loss = self.loss(x, y)
+        
+        self.log('test_loss', loss, sync_dist=True)
+        self.accuracy(x, y)
+        self.log("test_acc", self.accuracy)
+
     def forward(self, x):        
         if self.extract_features:
             x_f = self.convnet.features(x)
@@ -104,72 +117,3 @@ class EfficientNet(pl.LightningModule):
             return self.convnet.classifier(x), x_f
         else:
             return self.convnet(x)
-
-class EfficientnetB0(pl.LightningModule):
-    def __init__(self, args = None, out_features=4, class_weights=None, features=False):
-        super(EfficientnetB0, self).__init__()        
-        
-        self.save_hyperparameters()        
-        self.args = args
-
-        self.class_weights = class_weights
-        self.features = features
-
-        if(class_weights is not None):
-            class_weights = torch.tensor(class_weights).to(torch.float32)
-            
-        self.loss = nn.CrossEntropyLoss(weight=class_weights)
-        self.accuracy = torchmetrics.Accuracy()
-
-        self.model = nn.Sequential(
-            models.efficientnet_b0(pretrained=True).features,
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(start_dim=1),
-            nn.Linear(in_features=1280, out_features=out_features, bias=True)
-            )
-        
-        self.softmax = nn.Softmax(dim=1)
-        
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr)
-        return optimizer
-
-    def forward(self, x):        
-        if self.features:            
-            x = self.model[0](x)
-            x = self.model[1](x)
-            x_f = self.model[2](x)
-            x = self.model[3](x_f)
-            x = self.softmax(x)
-            return x, x_f
-        else:
-            x = self.model(x)
-            x = self.softmax(x)
-        return x
-
-    def training_step(self, train_batch, batch_idx):
-        x, y = train_batch
-        
-        x = self.model(x)
-
-        loss = self.loss(x, y)
-        
-        self.log('train_loss', loss)
-
-        self.accuracy(x, y)
-        self.log("train_acc", self.accuracy)
-        return loss
-
-    def validation_step(self, val_batch, batch_idx):
-        x, y = val_batch
-        
-        x = self.test_transform(x)
-        
-        x = self.model(x)
-        
-        loss = self.loss(x, y)
-        
-        self.log('val_loss', loss)
-        self.accuracy(x, y)
-        self.log("val_acc", self.accuracy)

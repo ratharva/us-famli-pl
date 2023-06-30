@@ -25,7 +25,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 def main(args):
     
     
-    model = EfficientNet(args, base_encoder=args.nn).load_from_checkpoint(args.model)
+    model = EfficientNet.load_from_checkpoint(args.model)
     model.eval()
     model.cuda()
 

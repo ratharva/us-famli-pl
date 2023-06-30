@@ -2,7 +2,6 @@
 import math
 import torch
 from torch import nn
-
 from torchvision import transforms
 
 # from pl_bolts.transforms.dataset_normalizations import (
@@ -25,7 +24,10 @@ from monai.transforms import (
     RandGaussianSmooth,
     BorderPad,
     RandSpatialCrop,
-    NormalizeIntensity
+    NormalizeIntensity,
+    RandAffined,
+    EnsureChannelFirstd,
+    LoadImaged
 )
 
 from monai import transforms as monai_transforms
@@ -266,13 +268,14 @@ class SimTestTransforms:
 #     def __call__(self, inp):
 #         return self.train_transform(inp)
 class USClassTrainTransforms:
-    def __init__(self, height: int = 128):
+    def __init__(self, height: int = 256):
 
         self.train_transform = transforms.Compose(
             [
                 ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
                 transforms.ColorJitter(brightness=[0.5, 1.5], contrast=[0.5, 1.5], saturation=[0.5, 1.5], hue=[-.2, .2]),
-                transforms.CenterCrop(height)
+                transforms.RandomHorizontalFlip(),
+                transforms.Compose([transforms.RandomRotation(180), transforms.Pad(64), transforms.RandomCrop(height)])
             ]
         )
 
@@ -284,9 +287,9 @@ class USClassEvalTransforms:
     def __init__(self, size=256, unsqueeze=False):
 
         self.test_transform = transforms.Compose(
-            [                
+            [   
+                ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
                 transforms.CenterCrop(size),
-                ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),                
             ]
         )
         self.unsqueeze = unsqueeze
@@ -563,8 +566,62 @@ class DiffusionEvalTransforms:
         self.eval_transform = transforms.Compose(
             [
                 EnsureChannelFirst(strict_check=False, channel_dim='no_channel'),
-                ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
+                # ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
                 transforms.CenterCrop(height)
+            ]
+        )
+
+    def __call__(self, inp):
+        return self.eval_transform(inp)
+
+
+
+class ZSample:
+    def __call__(self, x):   
+        z_mu = x['z_mu']
+        z_sigma = x['z_sigma']
+        return self.sampling(z_mu, z_sigma)
+
+    def sampling(self, z_mu: torch.Tensor, z_sigma: torch.Tensor) -> torch.Tensor:
+            """
+            From the mean and sigma representations resulting of encoding an image through the latent space,
+            obtains a noise sample resulting from sampling gaussian noise, multiplying by the variance (sigma) and
+            adding the mean.
+
+            Args:
+                z_mu: Bx[Z_CHANNELS]x[LATENT SPACE SIZE] mean vector obtained by the encoder when you encode an image
+                z_sigma: Bx[Z_CHANNELS]x[LATENT SPACE SIZE] variance vector obtained by the encoder when you encode an image
+
+            Returns:
+                sample of shape Bx[Z_CHANNELS]x[LATENT SPACE SIZE]
+            """
+            eps = torch.randn_like(z_sigma)
+            z_vae = z_mu + eps * z_sigma
+            return torch.tanh(z_vae)
+
+class ZGanTrainTransforms:
+    def __init__(self, height: int = 64):
+
+        # image augmentation functions
+        self.train_transform = transforms.Compose(
+            [                
+                EnsureChannelFirstd(keys=["z_mu", "z_sigma"], channel_dim=0),  
+                ZSample(),
+                transforms.RandomHorizontalFlip(),
+                transforms.Compose([transforms.RandomRotation(180), transforms.Pad(8), transforms.RandomCrop(height)])
+            ]
+        )
+
+    def __call__(self, inp):
+        return self.train_transform(inp)        
+
+class ZGanEvalTransforms:
+    def __init__(self, height: int = 64):
+
+        self.eval_transform = transforms.Compose(
+            [                
+                EnsureChannelFirstd(keys=["z_mu", "z_sigma"], channel_dim=0),
+                ZSample()
             ]
         )
 
