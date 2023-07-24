@@ -9,15 +9,15 @@ import torch
 from torch.distributed import is_initialized, get_rank
 
 from loaders.ultrasound_dataset import USDataModule, USDataModuleBlindSweep
-from transforms.ultrasound_transforms import Moco2TrainTransforms, Moco2EvalTransforms, SimCLRTrainTransforms, SimCLREvalTransforms, EffnetDecodeTrainTransforms, EffnetDecodeEvalTransforms, SimTrainTransforms, SimEvalTransforms, SimTrainTransformsV2
+from transforms.ultrasound_transforms import Moco2TrainTransforms, Moco2EvalTransforms, SimCLRTrainTransforms, SimCLREvalTransforms, EffnetDecodeTrainTransforms, EffnetDecodeEvalTransforms, SimTrainTransforms, SimEvalTransforms, SimTrainTransformsV2, SimTrainTransformsV3
 from callbacks.logger import MocoImageLogger, SimCLRImageLogger, EffnetDecodeImageLogger, SimImageLogger, SimScoreImageLogger, SimNorthImageLogger
-from nets.contrastive import USMoco, SimCLR, Sim, SimScore, SimScoreW, SimScoreWK, SimScoreOnlyW, SimScoreOnlyWExp, SimNorth
+from nets.contrastive import USMoco, SimCLR, Sim, SimScore, SimScoreW, SimScoreWK, SimScoreOnlyW, SimScoreOnlyWExp, SimNorth, ModSimScoreOnlyW
 from nets.hyper_sphere import LightHouse
 
 
-from pl_bolts.models.self_supervised.swav.transforms import (
-    SwAVTrainDataTransform, SwAVEvalDataTransform
-)
+# from pl_bolts.models.self_supervised.swav.transforms import (
+#     SwAVTrainDataTransform, SwAVEvalDataTransform
+# )
 
 from pl_bolts.transforms.dataset_normalizations import (
     imagenet_normalization
@@ -130,6 +130,26 @@ def main(args):
 
         usdata = USDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column='img_path', drop_last=True, train_transform=train_transform, valid_transform=valid_transform, scalar_column='score')    
         
+        #based on paper Wang(2020)
+    elif args.nn == "modsimscoreonlyw":
+        # if(args.train_transform == 2):
+        #     print("USING TRAIN TRANSFORM 2")
+        #     train_transform = SimTrainTransformsV2(224)    
+        # else:
+        #     train_transform = SimTrainTransformsV3(224)
+        # valid_transform = SimEvalTransforms(224)        
+
+        # model = ModSimScoreOnlyW(args, base_encoder=args.base_encoder, emb_dim=args.emb_dim, lr=args.lr, w=args.w, weight_decay=args.weight_decay, max_epochs=args.epochs)
+        # image_logger = SimScoreImageLogger()
+        
+
+        # usdata = USDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column='img_path', drop_last=True, train_transform=train_transform, valid_transform=valid_transform, scalar_column='score')    
+        model = ModSimScoreOnlyW(hidden_dim=args.emb_dim, lr=args.lr, temperature=args.temperature, weight_decay=args.weight_decay, max_epochs=args.epochs, base_encoder=args.base_encoder)
+        image_logger = SimCLRImageLogger()
+
+        usdata = USDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column='img_path', ga_column='ga_boe', train_transform=SimTrainTransformsV3(224), valid_transform=SimEvalTransforms(224), drop_last=True)
+
+
     elif args.nn == "simscoreonlywexp":
 
         if(args.train_transform == 2):
@@ -167,7 +187,7 @@ def main(args):
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.out,
-        filename='{epoch}-{val_loss:.2f}',
+        filename='{epoch}-{val_loss:.10f}',
         save_top_k=2,
         monitor='val_loss'
     )

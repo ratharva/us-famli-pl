@@ -226,6 +226,28 @@ class SimTrainTransformsV2:
         k = self.train_transform(inp)
         return q, k
 
+#additional transforms
+class SimTrainTransformsV3:
+    def __init__(self, height: int = 128):
+
+        # image augmentation functions
+        self.train_transform = transforms.Compose(
+            [
+                # ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
+                transforms.ColorJitter(brightness=[0.5, 1.5], contrast=[0.5, 1.5], saturation=[0.5, 1.5], hue=[-.2, .2]),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomAdjustSharpness(2),
+                transforms.Compose([transforms.RandomRotation(180), transforms.Pad(32), transforms.RandomCrop(height)]),
+                
+                # transforms.Sobel(3)
+            ]
+        )
+
+    def __call__(self, inp):
+        q = self.train_transform(inp)
+        k = self.train_transform(inp)
+        return q, k
+
 class SimEvalTransforms:
     def __init__(self, height: int = 128):
 

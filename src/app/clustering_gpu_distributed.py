@@ -2,14 +2,24 @@ import os
 
 import numpy as np
 import pandas as pd
+import cudf
+# from cuml.cluster import KMeans as KMeans
+from cuml.dask.cluster import KMeans as KMeans
+import cuml
+from cuml.dask.datasets import make_blobs
+from dask.distributed import Client
+from dask_cuda import LocalCUDACluster
 
 import torch
 import pickle
 import argparse
+import dask.array
 
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans as sKMeans
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+
+import yellowbrick.contrib.wrapper
 
 from yellowbrick.cluster import SilhouetteVisualizer
 from yellowbrick.cluster import KElbowVisualizer
@@ -21,9 +31,9 @@ def main(args):
     csv_path = os.path.join(mount_point, args.csv)
 
     if(os.path.splitext(csv_path)[1] == ".csv"):        
-        test_df = pd.read_csv(csv_path)
+        test_df = cudf.read_csv(csv_path)
     else:
-        test_df = pd.read_parquet(csv_path)
+        test_df = cudf.read_parquet(csv_path)
 
     features_path = os.path.join(mount_point, args.features)
 
@@ -32,7 +42,7 @@ def main(args):
         features = features.squeeze()
 
     if args.split_fn:
-        idx_sample = list(pd.read_csv(args.split_fn, header=None)[1])
+        idx_sample = list(cudf.read_csv(args.split_fn, header=None)[1])
     elif 0 < args.split and args.split < 1.0:
         idx_sample = np.random.choice(np.arange(features.shape[0]), size=int(features.shape[0]*args.split))
 
@@ -52,13 +62,24 @@ def main(args):
             with open(args.cluster_centers, 'rb') as f:
                 cluster_centers = pickle.load(f)
         else:
-            cluster_centers = torch.from_numpy(np.array(pd.read_csv(args.cluster_centers, header=None)))     
+            cluster_centers = torch.from_numpy(np.array(cudf.read_csv(args.cluster_centers, header=None)))     
 
     # kmeans
+    features = dask.array.from_array(features)
+    cluster = LocalCUDACluster()
+    c = Client(cluster)
+    print("TYPE OF FEATURES: ", type(features))
+    # features = c.scatter(features)
+    # features = c.scatter(features)
 
     if args.elbow:
         # Instantiate the clustering model and visualizer
-        model = KMeans()
+        model1 = KMeans()
+        # cluster = LocalCUDACluster()
+        # c = Client(cluster)
+        # features = c.scatter(features)
+        # features, _ = make_blobs(n_samples = 5000)
+        model = yellowbrick.contrib.wrapper.clusterer(model1)
         visualizer = KElbowVisualizer(
             model, k=(args.n_clusters_min, args.n_clusters), metric='distortion'
         )
@@ -85,31 +106,44 @@ def main(args):
 
         plt.figure()
         plt.clf()
-        # Instantiate the clustering model and visualizer        
-        visualizer = KElbowVisualizer(
-            model, k=(args.n_clusters_min, args.n_clusters), metric='silhouette', locate_elbow=False
-        )
-        visualizer.fit(features)        # Fit the data to the visualizer
+        # Instantiate the clustering model and visualizer    
+        # print("Moving to silhouette!!")    
+        # visualizer = KElbowVisualizer(
+        #     model, k=(args.n_clusters_min, args.n_clusters), metric='silhouette', locate_elbow=False
+        # )
+        # visualizer.fit(features)        # Fit the data to the visualizer
         
-        out_elbow = features_path.replace(".pickle", "_elbow_silhouette.png")
-        print("Writing:", out_elbow)
-        visualizer.show(outpath=out_elbow)        # Finalize and render the figure
+        # out_elbow = features_path.replace(".pickle", "_elbow_silhouette.png")
+        # print("Writing:", out_elbow)
+        # visualizer.show(outpath=out_elbow)        # Finalize and render the figure
+        # plt.figure()
+        # plt.clf()
 
         args.n_clusters = n_clusters_optim
-
-
+        
+    print("All graphs complete!!")
+    
     km = KMeans(
         n_clusters=args.n_clusters, init=cluster_centers, verbose=True, max_iter=args.max_iter
     ).fit(features)
 
+    print("MOdel fit complete!!")
+
+    skm = sKMeans()
+    with cuml.using_output_type("numpy"):
+        skm.labels_ = km.labels_
+        skm.cluster_centers_ = km.cluster_centers_
+    skm._n_threads = 1
+
 
     if args.silhouette:
+        km = yellowbrick.contrib.wrapper.clusterer(km)
         visualizer = SilhouetteVisualizer(km, colors='yellowbrick')
         visualizer.fit(features)        # Fit the data to the visualizer
 
         out_silhouette = features_path.replace(".pickle", "_silhouette.png")
         print("Writing:", out_silhouette)
-        visualizer.show(outpath=out_silhouette) 
+        visualizer.show(outpath=out_silhouette)
 
     if isinstance(cluster_centers, str) and cluster_centers == "k-means++":
         out_centers = features_path.replace(".pickle", "_centers.pickle")
@@ -171,7 +205,7 @@ def main(args):
 
         plt.figure()
         plt.clf()
-        sns.scatterplot(test_df, x='pca_0',y='pca_1', hue='pred_cluster', palette=sns.color_palette("hls", args.n_clusters), legend="brief")
+        sns.scatterplot(test_df.to_numpy(), x='pca_0',y='pca_1', hue='pred_cluster', palette=sns.color_palette("hls", args.n_clusters), legend="brief")
         out_tsne = features_path.replace(".pickle", split_tsne + "pca_sample.png")
         plt.savefig(out_tsne)
 
@@ -182,14 +216,14 @@ def main(args):
 
         plt.figure()
         plt.clf()
-        sns.scatterplot(test_df, x='tsne_0',y='tsne_1', hue='pred_cluster', palette=sns.color_palette("hls", args.n_clusters), legend="brief")
+        sns.scatterplot(test_df.to_numpy(), x='tsne_0',y='tsne_1', hue='pred_cluster', palette=sns.color_palette("hls", args.n_clusters), legend="brief")
         out_tsne = features_path.replace(".pickle", split_tsne + "tsne_sample.png")
         plt.savefig(out_tsne)
 
         if "tag" in test_df.columns:
             plt.figure()
             plt.clf()
-            sns.scatterplot(test_df, x='tsne_0',y='tsne_1', hue='tag', palette=sns.color_palette("hls", args.n_clusters), legend="brief")
+            sns.scatterplot(test_df.to_numpy(), x='tsne_0',y='tsne_1', hue='tag', palette=sns.color_palette("hls", args.n_clusters), legend="brief")
             out_tsne = features_path.replace(".pickle", split_tsne + "tsne_sample_tag.png")
             plt.savefig(out_tsne)
         

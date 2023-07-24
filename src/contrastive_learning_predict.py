@@ -10,7 +10,7 @@ from torch import nn
 from loaders.ultrasound_dataset import USDataset
 from transforms.ultrasound_transforms import Moco2TestTransforms, SimCLRTestTransforms, SimTestTransforms
 # from pl_bolts.models.self_supervised import Moco_v2
-from nets.contrastive import USMoco, SimCLR, Sim, SimScore, SimNorth
+from nets.contrastive import USMoco, SimCLR, Sim, SimScore, SimNorth, ModSimScoreOnlyW
 from tqdm import tqdm
 
 from pl_bolts.transforms.dataset_normalizations import (
@@ -33,6 +33,11 @@ def main(args):
 
     elif args.nn == "simclr":
         model = SimCLR(hidden_dim=args.emb_dim, base_encoder=args.base_encoder).load_from_checkpoint(args.model)
+        
+        transform = SimCLRTestTransforms(224)
+    
+    elif args.nn == "modsimscoreonlyw":
+        model = ModSimScoreOnlyW(hidden_dim=args.emb_dim, base_encoder=args.base_encoder).load_from_checkpoint(args.model)
         
         transform = SimCLRTestTransforms(224)
 
@@ -73,6 +78,8 @@ def main(args):
 
         features = []
         for idx, X in tqdm(enumerate(test_loader), total=len(test_loader)):             
+            # print("THE SHAPE OF X IS: ", X.shape)
+            # print("THE TYPE OF X IS: ", type(X))
             X = X.cuda(non_blocking=True).contiguous()           
             feat = model(X)
             features.append(feat.cpu())

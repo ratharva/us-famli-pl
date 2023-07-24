@@ -138,7 +138,7 @@ class ProjectionHead(nn.Module):
 
     def forward(self, x):
         x = self.model(x)  
-        # x = torch.abs(x)      
+        x = torch.abs(x)      
         return F.normalize(x, dim=1)
 
 class GaussianNoise(nn.Module):    
@@ -1030,46 +1030,79 @@ class SimNorth(pl.LightningModule):
 #Changes to loss function according to Wang(2020)
 
 class AlignmentUniformityLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, margin, temperature):
         super(AlignmentUniformityLoss, self).__init__()
-    
-    def align_loss(self, x, y, alpha=2):
-        return (x - y).norm(p=2, dim=1).pow(alpha).mean()
+        self.margin = margin
+        self.temperature = temperature
 
-    def uniform_loss(self, x, t=2):
-        return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
-     
+    def forward(self, embeddings):
+        # Compute similarity matrix
+        # similarity_matrix = torch.matmul(embeddings, embeddings.t()) / self.temperature
+        similarity_matrix = F.cosine_similarity(embeddings[:,None,:], embeddings[None,:,:], dim=-1)
 
-    def forward(self, x, y, align_scale, unif_scale):
+        # Compute alignment loss
+        alignment_loss = self.alignment_loss(similarity_matrix)
 
-        return align_scale * self.align_loss(x, y) + unif_scale * self.uniform_loss(x)
+        # Compute uniformity loss
+        uniformity_loss = self.uniformity_loss(similarity_matrix)
+
+        return alignment_loss + uniformity_loss
+
+    def alignment_loss(self, similarity_matrix):
+        batch_size = similarity_matrix.size(0)
+
+        # Compute positive mask
+        # mask = labels.expand(batch_size, batch_size).eq(labels.expand(batch_size, batch_size).t())
+        mask = torch.eye(similarity_matrix.shape[0], dtype=torch.bool, device=similarity_matrix.device)
+
+        # Compute average similarity of positive pairs
+        positive_similarity = similarity_matrix[mask].view(batch_size, -1).mean(dim=1)
+
+        # Compute average similarity of negative pairs
+        negative_similarity = similarity_matrix[~mask].view(batch_size, -1).mean(dim=1)
+
+        # Compute alignment loss
+        alignment_loss = torch.relu(negative_similarity - positive_similarity + self.margin).mean()
+
+        return alignment_loss
+
+    def uniformity_loss(self, similarity_matrix):
+        batch_size = similarity_matrix.size(0)
+
+        # Exclude self-similarity
+        similarity_matrix = similarity_matrix - torch.diag(similarity_matrix.diag())
+
+        # Compute uniformity loss
+        uniformity_loss = torch.logsumexp(similarity_matrix, dim=1).mean()
+
+        return -uniformity_loss
 
 
 class ModSimScoreOnlyW(pl.LightningModule):
-    def __init__(self, hidden_dim, lr=1e-3, temperature=0.1, weight_decay=1e-4, max_epochs=500, base_encoder='resnet18'):
+    def __init__(self, args=None, base_encoder='efficientnet_b0', emb_dim=128, lr=1e-3, w=4.0, alpha=0.1, beta=0.3, weight_decay=1e-4, max_epochs=50):
         super().__init__()
         self.save_hyperparameters()
-        assert self.hparams.temperature > 0.0, 'The temperature must be a positive float!'
-        # Base model f(.)
-
-        template_model = getattr(torchvision.models, base_encoder)
-        self.convnet = template_model(num_classes=4*hidden_dim)
+        self.lam = 1.0
+        template_model = getattr(torchvision.models, self.hparams.base_encoder)
+        # print("TEMPLATE MODEL IS: ", template_model)
+        self.convnet = template_model(num_classes=4*self.hparams.emb_dim)
+        self.base_encoder = base_encoder
 
         if hasattr(self.convnet, 'classifier'):
             self.convnet.classifier = nn.Sequential(
                 self.convnet.classifier,
-                ProjectionHead(input_dim=4*self.hparams.hidden_dim, hidden_dim=4*self.hparams.hidden_dim, output_dim=self.hparams.hidden_dim)
+                ProjectionHead(input_dim=4*self.hparams.emb_dim, hidden_dim=64, output_dim=self.hparams.emb_dim)
             )            
 
         elif hasattr(self.convnet, 'fc'):
         
             self.convnet.fc = nn.Sequential(
                 self.convnet.fc,  # Linear(ResNet output, 4*hidden_dim)
-                ProjectionHead(input_dim=4*self.hparams.hidden_dim, hidden_dim=4*self.hparams.hidden_dim, output_dim=self.hparams.hidden_dim)
+                ProjectionHead(input_dim=4*self.hparams.emb_dim, hidden_dim=64, output_dim=self.hparams.emb_dim)
             )
 
         # self.loss = nn.CosineSimilarity()
-        self.loss_fn = AlignmentUniformityLoss()
+        self.loss_fn = AlignmentUniformityLoss(margin=0.5, temperature=0.5)
 
         self.noise_transform = torch.nn.Sequential(
             GaussianNoise()
@@ -1083,34 +1116,158 @@ class ModSimScoreOnlyW(pl.LightningModule):
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams.max_epochs, eta_min=self.hparams.lr/50)
         return [optimizer], [lr_scheduler]
 
+    # def lalign(self, x, y, alpha=2):
+    #     return (x - y).norm(dim=1).pow(alpha).mean()
+    
+    # def lunif(self, x, t=2):
+    #     x = torch.flatten(x)
+    #     sq_pdist = torch.pdist(x, p=2).pow(2)
+    #     return sq_pdist.mul(-t).exp().mean().log()
+
+    # def alignUnifLoss(self, x, y, mode):
+
+    #     alignUnifLoss = self.lalign(x, y) + self.lam * (self.lunif(x) + self.lunif(y)) / 2
+    #     self.log(mode + '_loss_proj', alignUnifLoss)
+
+    # def training_step(self, batch, batch_idx):
+    #     (x_0, x_1), score = batch
+    #     # print("Shape of X_0, X_1", x_0.shape, x_1.shape)
+    #     return self.alignUnifLoss(x_0, x_1, mode='train')
+
+    # def validation_step(self, batch, batch_idx):
+    #     (x_0, x_1), score = batch
+    #     print("Shape of X_0, X_1", x_0.shape, x_1.shape)
+    #     self.alignUnifLoss(x_0, x_1, mode='val')
+
     def forward(self, x):
+        # return self.convnet(x)
+        # Forward pass through the base encoder
+        print("SHAPE OF X IS: ", type(x))
+        # embeddings = self.convnet.extract_features(x)
+        # embeddings = nn.AdaptiveAvgPool2d(1)(embeddings)
+        # embeddings = embeddings.view(embeddings.size(0), -1)
         embeddings = self.convnet(x)
 
-        return embeddings
+        # Forward pass through the classifier head
+        logits = self.classifier(embeddings)
+
+        return embeddings, logits
     
     def training_step(self, batch, batch_idx):
-        # print("BATCH TYPE: ", type(batch))
-        (x, y), labels = batch
-        # print("LABELS ARE: ", labels)
-        embedding1 = self.forward(x)
-        embedding2 = self.forward(y)
-        # print(type(embedding1))
+        print("BATCH TYPE: ", type(batch))
+        inputs, labels = batch
+        # (x1, x2), labels = batch
+
+        # Forward pass
+        embeddings, logits = self.forward(inputs)
 
         # Compute loss
-        loss = self.loss_fn(embedding1, embedding2, 1.0, 0.01)
+        loss = self.loss_fn(embeddings, labels)
 
-        self.log('train_loss', loss.item())
+        self.log('train_loss', loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # print("BATCH TYPE: ", type(batch))
-        (x, y), labels = batch
-        # print("LABELS ARE: ", labels)
-        embedding1 = self.forward(x)
-        embedding2 = self.forward(y)
-        # print(type(embedding1))
+        print("BATCH TYPE: ", type(batch))
+        inputs, labels = batch
+        # (x1, x2), lab1 = batch
+        # print("X1 type: ", type(x1))
+        # print("Label type: ", type(labels))
+        # print("LAB1 TYPE: ", type(lab1))
+
+        # Forward pass
+        embeddings, logits = self.forward(inputs)
 
         # Compute loss
-        loss = self.loss_fn(embedding1, embedding2, 1.0, 0.01)
+        loss = self.loss_fn(embeddings, labels)
 
-        self.log('val_loss', loss.item())
+        self.log('val_loss', loss)
+        # Add other metrics as needed for validation
+
+# class ModSimScoreOnlyW(pl.LightningModule):
+#     def __init__(self, args=None, base_encoder='efficientnet_b0', emb_dim=128, lr=1e-3, w=4.0, alpha=0.1, beta=0.3, weight_decay=1e-4, max_epochs=50):
+#         super().__init__()
+#         self.save_hyperparameters()
+#         self.lam = 1.0
+#         template_model = getattr(torchvision.models, self.hparams.base_encoder)
+#         # print("TEMPLATE MODEL IS: ", template_model)
+#         self.convnet = template_model(num_classes=4*self.hparams.emb_dim)
+#         self.base_encoder = base_encoder
+
+#         if hasattr(self.convnet, 'classifier'):
+#             self.convnet.classifier = nn.Sequential(
+#                 self.convnet.classifier,
+#                 ProjectionHead(input_dim=4*self.hparams.emb_dim, hidden_dim=64, output_dim=self.hparams.emb_dim)
+#             )            
+
+#         elif hasattr(self.convnet, 'fc'):
+        
+#             self.convnet.fc = nn.Sequential(
+#                 self.convnet.fc,  # Linear(ResNet output, 4*hidden_dim)
+#                 ProjectionHead(input_dim=4*self.hparams.emb_dim, hidden_dim=64, output_dim=self.hparams.emb_dim)
+#             )
+
+#         # self.loss = nn.CosineSimilarity()
+#         self.loss_fn = AlignmentUniformityLoss(margin=0.5, temperature=0.5)
+
+#         self.noise_transform = torch.nn.Sequential(
+#             GaussianNoise()
+#         )
+
+
+#     def configure_optimizers(self):
+#         optimizer = optim.AdamW(self.parameters(),
+#                                 lr=self.hparams.lr,
+#                                 weight_decay=self.hparams.weight_decay)
+#         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams.max_epochs, eta_min=self.hparams.lr/50)
+#         return [optimizer], [lr_scheduler]
+
+#     def combined_loss(self, x0, x1):
+#         myAlign_loss = self.alignment_loss()
+#         myUnifLoss = self.uniformity_loss()
+
+#         return myAlign_loss + myUnifLoss
+
+#     def alignment_loss(self, x0, x1):
+#         similarity_matrix = torch.matmul(x0, x1) / self.temperature
+#         batch_size = similarity_matrix.size(0)
+
+#         # Compute positive mask
+#         mask = torch.eye(batch_size).bool()
+
+#         # Compute average similarity of positive pairs
+#         positive_similarity = similarity_matrix[mask].view(batch_size, -1).mean(dim=1)
+
+#         # Compute average similarity of negative pairs
+#         negative_similarity = similarity_matrix[~mask].view(batch_size, -1).mean(dim=1)
+
+#         # Compute alignment loss
+#         alignment_loss = torch.relu(negative_similarity - positive_similarity + self.margin).mean()
+
+#         return alignment_loss
+
+#     def uniformity_loss(self, x0, x1):
+#         similarity_matrix = torch.matmul(x0, x1) / self.temperature
+#         batch_size = similarity_matrix.size(0)
+
+#         # Exclude self-similarity
+#         similarity_matrix = similarity_matrix - torch.diag(similarity_matrix.diag())
+
+#         # Compute uniformity loss
+#         uniformity_loss = torch.logsumexp(similarity_matrix, dim=1).mean()
+
+#         return -uniformity_loss
+
+#     def training_step(self, batch, batch_idx):
+#         (x_0, x_1), score = batch
+#         # print("Shape of X_0, X_1", x_0.shape, x_1.shape)
+#         return self.combined_loss(x_0, x_1, mode='train')
+
+#     def validation_step(self, batch, batch_idx):
+#         (x_0, x_1), score = batch
+#         print("Shape of X_0, X_1", x_0.shape, x_1.shape)
+#         self.combined_loss(x_0, x_1, mode='val')
+
+#     def forward(self, x):
+#         return self.convnet(x)
+#         # Forward pass through the base encoder
