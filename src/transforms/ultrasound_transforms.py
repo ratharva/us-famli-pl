@@ -297,9 +297,29 @@ class USClassTrainTransforms:
                 ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
                 transforms.ColorJitter(brightness=[0.5, 1.5], contrast=[0.5, 1.5], saturation=[0.5, 1.5], hue=[-.2, .2]),
                 transforms.RandomHorizontalFlip(),
-                transforms.Compose([transforms.RandomRotation(180), transforms.Pad(64), transforms.RandomCrop(height)])
+                transforms.RandomChoice([
+                    transforms.Compose([transforms.RandomRotation(180), transforms.Pad(64), transforms.RandomCrop(height)]),
+                    transforms.RandomResizedCrop(size=height, scale=(0.4, 1.0), ratio=(0.75, 1.3333333333333333))
+                ])
             ]
         )
+        # self.train_transform = transforms.Compose(
+        #     [
+        #         ScaleIntensityRange(a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0),
+        #         # transforms.ColorJitter(brightness=[0.5, 1.5], contrast=[0.5, 1.5], saturation=[0.5, 1.5], hue=[-.2, .2]),
+        #         transforms.RandomHorizontalFlip(),
+        #         transforms.Compose([transforms.RandomRotation(180), transforms.Pad(64), transforms.RandomCrop(height)])
+        #     ]
+        # )
+        # self.train_transform = transforms.Compose([
+        #     transforms.RandomHorizontalFlip(p=0.5),  # Randomly flip horizontally with 50% probability
+        #     transforms.RandomVerticalFlip(p=0.5),    # Randomly flip vertically with 50% probability
+        #     transforms.RandomRotation(degrees=(-15, 15)),  # Random rotation between -15 and 15 degrees
+        #     transforms.RandomResizedCrop(size=(64, 64), scale=(0.8, 1.0), ratio=(0.8, 1.2)),  # Random resized crop
+        #     transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # Adjust color
+        #     # transforms.ToTensor(),  # Convert the image to a tensor
+        #     transforms.Normalize(mean=[0.5], std=[0.5])  # Normalize pixel values
+        # ])
 
     def __call__(self, inp):
         return self.train_transform(inp)

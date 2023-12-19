@@ -1,0 +1,10 @@
+,precision,recall,f1-score,support
+No structures visible,0.0,0.0,0.0,139.0
+Head Visible,0.0,0.0,0.0,487.0
+Abdomen Visible,0.0,0.0,0.0,448.0
+Femur Visible,0.0,0.0,0.0,463.0
+Placenta visible,0.0,0.0,0.0,751.0
+micro avg,0.0,0.0,0.0,2288.0
+macro avg,0.0,0.0,0.0,2288.0
+weighted avg,0.0,0.0,0.0,2288.0
+samples avg,0.0,0.0,0.0,2288.0

@@ -7,6 +7,7 @@ import numpy as np
 
 import torch
 from torch.distributed import is_initialized, get_rank
+import neptune
 
 from loaders.ultrasound_dataset import USDataModule, USDataModuleBlindSweep
 from transforms.ultrasound_transforms import Moco2TrainTransforms, Moco2EvalTransforms, SimCLRTrainTransforms, SimCLREvalTransforms, EffnetDecodeTrainTransforms, EffnetDecodeEvalTransforms, SimTrainTransforms, SimEvalTransforms, SimTrainTransformsV2, SimTrainTransformsV3
@@ -142,7 +143,12 @@ def main(args):
         # model = ModSimScoreOnlyW(args, base_encoder=args.base_encoder, emb_dim=args.emb_dim, lr=args.lr, w=args.w, weight_decay=args.weight_decay, max_epochs=args.epochs)
         # image_logger = SimScoreImageLogger()
         
-
+        # model = neptune.init_model_version(
+        # name="Prediction model",
+        # key="MOD1", 
+        # project="contrastive/boundingBox", 
+        # api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiJiZGM3N2EyZi05MGRlLTRlYmMtYTVhYi0xZWU3N2NkODI2OWIifQ==", # your credentials
+        # )
         # usdata = USDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column='img_path', drop_last=True, train_transform=train_transform, valid_transform=valid_transform, scalar_column='score')    
         model = ModSimScoreOnlyW(hidden_dim=args.emb_dim, lr=args.lr, temperature=args.temperature, weight_decay=args.weight_decay, max_epochs=args.epochs, base_encoder=args.base_encoder)
         image_logger = SimCLRImageLogger()
@@ -198,11 +204,20 @@ def main(args):
         logger = TensorBoardLogger(save_dir=args.tb_dir, name=args.tb_name)    
 
     elif args.neptune_tags:
+        
         logger = NeptuneLogger(
-            project='ImageMindAnalytics/LiteAUS',
-            tags=args.neptune_tags,
-            api_key=os.environ['NEPTUNE_API_TOKEN']
+            project="contrastive/boundingBox",
+            api_key="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiJiZGM3N2EyZi05MGRlLTRlYmMtYTVhYi0xZWU3N2NkODI2OWIifQ==",
+            log_model_checkpoints=True,
         )
+        PARAMS = {
+            "max_epochs": args.epochs,
+            "learning_rate": args.lr,
+            "batch_size": args.batch_size
+        }
+        logger.log_hyperparams(params=PARAMS)
+    
+    
 
     trainer = Trainer(
         logger=logger,

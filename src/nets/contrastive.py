@@ -1040,10 +1040,9 @@ class AlignmentUniformityLoss(nn.Module):
         return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
      
 
-    def forward(self, x, y, align_scale, unif_scale):
-
-        return align_scale * self.align_loss(x, y) + unif_scale * self.uniform_loss(x)
-
+    def forward(self, x, y, lam):
+        return self.align_loss(x, y) + lam * (self.uniform_loss(x) + self.uniform_loss(x)) / 2
+        
 
 class ModSimScoreOnlyW(pl.LightningModule):
     def __init__(self, hidden_dim, lr=1e-3, temperature=0.1, weight_decay=1e-4, max_epochs=500, base_encoder='resnet18'):
@@ -1097,8 +1096,7 @@ class ModSimScoreOnlyW(pl.LightningModule):
         # print(type(embedding1))
 
         # Compute loss
-        loss = self.loss_fn(embedding1, embedding2, 1.0, 0.01)
-
+        loss = self.loss_fn(embedding1, embedding2, 0.1)
         self.log('train_loss', loss.item())
         return loss
 
@@ -1111,6 +1109,5 @@ class ModSimScoreOnlyW(pl.LightningModule):
         # print(type(embedding1))
 
         # Compute loss
-        loss = self.loss_fn(embedding1, embedding2, 1.0, 0.01)
-
+        loss = self.loss_fn(embedding1, embedding2, 0.1)
         self.log('val_loss', loss.item())
